@@ -1,8 +1,10 @@
 # EuroScope WebSocket Data plugin (prototype)
 
 A EuroScope 3.2.x plugin that runs a small WebSocket server inside EuroScope and
-streams every radar target (position, altitude, speed, heading, squawk and basic
-flight plan data) as JSON, once a second, to any connected client.
+streams JSON to any connected client: every radar target with its full flight plan and
+controller data (once a second), the online controllers, METARs and active runways,
+planned routes, and events as they happen. Clients pick the topics they want, can filter
+aircraft, and (if you allow it) can send commands such as assume, handoff or set cleared level.
 
 No third-party dependencies: the WebSocket server, SHA-1 and JSON encoding are
 built in, and the C runtime is linked statically, so you ship a single DLL.
@@ -17,13 +19,15 @@ The SDK is only ever called from EuroScope's own thread.
 | Path | What |
 |---|---|
 | `src/Plugin.cpp` | The EuroScope plugin: captures data in `OnTimer`, `.wsdata` command |
-| `src/WsServer.*` | Portable WebSocket broadcast server on a background thread |
-| `src/Snapshot.h` | Plain data structs + JSON encoder (no EuroScope types) |
+| `src/WsServer.*` | Portable WebSocket server with topics and retained messages, on a background thread |
+| `src/Snapshot.h` | Plain data structs + JSON encoders (no EuroScope types) |
+| `src/Protocol.h` | Client protocol shared by plugin and fake feed: subscriptions, filters, auth, commands |
+| `src/JsonParse.h` | Small JSON reader for client messages |
 | `tools/fake_feed.cpp` | Same server with simulated aircraft, for testing clients without EuroScope |
 | `clients/viewer.html` | Browser viewer: live map (MapLibre + Protomaps) and table |
 | `clients/serve.py` | Serves the viewer and a local `map.pmtiles` basemap (range requests) |
 | `clients/test_client.py` | Terminal client (`pip install websockets`) |
-| `scripts/smoke_test.py` | CI check: runs `fake_feed` and validates a snapshot over WebSocket |
+| `scripts/smoke_test.py` | CI check: runs `fake_feed` and checks the protocol over WebSocket (topics, filters, commands) |
 | `.github/workflows/` | CI (build + smoke test) and tag-triggered releases |
 | `sdk/` | Put `EuroScopePlugIn.h` and `EuroScopePlugInDll.lib` here (not included) |
 
@@ -50,10 +54,33 @@ Commands (type in the EuroScope command line):
 | `.wsdata port 9000` | Change port (saved in your settings, restarts server) |
 | `.wsdata bind 0.0.0.0` | Listen on all interfaces so other PCs can connect (default is this PC only) |
 | `.wsdata interval 2` | Push every 2 seconds |
+| `.wsdata commands on` / `off` | Allow clients to send commands (off by default, saved) |
+| `.wsdata token <secret>` / `off` | Require this token for commands (saved) |
 | `.wsdata restart` | Restart the server |
 
-## Message format
-One message per tick, always the full picture (clients don't need to track diffs):
+## Protocol
+Every message is a JSON object with a `type`. Messages belong to topics. A new client is subscribed to
+`aircraft`, `controllers`, `airports` and `events`, and straight away gets `hello` plus the latest
+`aircraft`, `controllers` and `airports` message, so it doesn't wait for the next tick. `time` is Unix
+milliseconds everywhere. Altitudes in feet, speeds in knots, headings in degrees, distances in nm.
+
+| Topic | Sent | Content |
+|---|---|---|
+| `hello` | on connect, and when settings change | plugin version, protocol version, topics, whether commands are on |
+| `aircraft` | every interval (1 s) | every radar target with flight plan, controller assigned data and coordination |
+| `controllers` | every interval | everyone online, plus `me` (own callsign, connection type, selected aircraft) |
+| `airports` | when a METAR or active runway changes | METAR and active departure/arrival runways per airport |
+| `events` | as they happen | flight plan and assigned data changes, tracking and handoffs, connects/disconnects |
+| `routes` | every 5 s, **opt-in** | planned route points with ETA and profile altitude, and predicted positions |
+
+### hello
+```json
+{"type":"hello","time":1793660596000,"protocol":2,"plugin":"WebSocket Data","version":"0.2.0","source":"EKCH_APP",
+ "topics":["aircraft","controllers","airports","events","routes"],"defaultTopics":["aircraft","controllers","airports","events"],
+ "commands":false,"tokenRequired":false}
+```
+
+### aircraft
 ```json
 {
   "type": "aircraft", "time": 1793660596000, "source": "EKCH_APP", "count": 1,
@@ -63,22 +90,115 @@ One message per tick, always the full picture (clients don't need to track diffs
     "verticalSpeed": 0, "squawk": "1001", "modeC": true, "ident": false,
     "flightPlan": {
       "origin": "EKCH", "destination": "ESSA", "alternate": "", "aircraftType": "B738",
-      "wakeCategory": "M", "flightRules": "I", "route": "...", "requestedAltitude": 36000,
-      "clearedAltitude": 10000, "assignedSquawk": "1001", "assignedHeading": 0,
-      "assignedSpeed": 0, "trackingController": "EKCH_APP", "groundState": ""
+      "aircraftInfo": "B738/M-SDE2E3FGHIRWY/LB1", "wakeCategory": "M", "engineType": "J", "engineCount": 2,
+      "capabilities": "L", "flightRules": "I", "route": "...", "remarks": "PBN/A1B1C1D1 /V/",
+      "sid": "SIMEG1A", "star": "", "departureRunway": "22R", "arrivalRunway": "",
+      "trueAirspeed": 450, "estimatedDeparture": "1200", "actualDeparture": "", "enrouteTime": "1:15",
+      "fuelTime": "3:30", "pilotName": "...", "requestedAltitude": 36000,
+      "clearedAltitude": 10000, "assignedSquawk": "1001", "assignedHeading": 0, "assignedSpeed": 0,
+      "assignedMach": 0.00, "assignedRate": 0, "directTo": "", "scratchpad": "", "communicationType": "V",
+      "annotations": ["", "", "", "", "", "", "", "", ""], "clearance": false, "groundState": "",
+      "trackingController": "EKCH_APP", "trackedByMe": true, "handoffTarget": "", "nextController": "EKDK_CTR",
+      "state": "assumed", "sectorEntryMinutes": -1, "sectorExitMinutes": 10, "entryPoint": "", "exitPoint": "SIMEG",
+      "distanceToDestination": 300.0, "distanceFromOrigin": 20.0
     }
   }]
 }
 ```
-`flightPlan` is `null` for targets without a correlated flight plan. `time` is Unix milliseconds,
-`source` is your own controller callsign. Altitudes in feet, speeds in knots, heading in degrees.
-A client that connects gets the latest snapshot straight away. Text a client sends is received
-by the server but not used yet (hook for future commands).
+`flightPlan` is `null` for targets without a correlated flight plan. `source` is your own callsign.
+Zero or empty means "not set" for the assigned values. `assignedMach` is a Mach number (0.78).
+`state` is one of `notConcerned`, `notified`, `coordinated`, `transferToMe`, `transferFromMe`, `assumed`,
+`redundant`. `annotations` are the 9 flight strip annotations. `sectorEntryMinutes`/`sectorExitMinutes`
+are -1 when not applicable.
+
+### controllers
+```json
+{"type":"controllers","time":1793660596000,
+ "me":{"callsign":"EKCH_APP","connectionType":"direct","asel":"SAS107","controller":{...}},
+ "count":1,"controllers":[{"callsign":"EKCH_TWR","name":"...","frequency":118.105,"facility":"TWR","rating":"S2",
+   "positionId":"CT","sectorFile":"EKCH_TWR","lat":55.618,"lon":12.656,"range":50,"isController":true,"isMe":false}]}
+```
+`connectionType` is `offline`, `direct`, `proxy`, `simulatorServer`, `playback`, `simulatorClient` or `sweatbox`.
+`asel` is the aircraft currently selected in EuroScope. `frequency` 199.998 means none.
+
+### airports
+```json
+{"type":"airports","time":1793660596000,"count":1,"airports":[{"icao":"EKCH",
+  "metar":"EKCH 071820Z 24012KT 9999 FEW030 08/04 Q1012 NOSIG","departureRunways":["22R"],"arrivalRunways":["22L"]}]}
+```
+METARs are the ones EuroScope downloads (the stations in your weather list). Active runways come from
+the sector file and are re-checked every 30 s and whenever you change them. EuroScope gives plugins no
+access to ATIS text or frequency chat, so those aren't available.
+
+### events
+```json
+{"type":"event","event":"assignedDataChanged","time":1793660596000,"callsign":"SAS107","field":"clearedAltitude","flightPlan":{...}}
+```
+| `event` | Fields |
+|---|---|
+| `flightPlanUpdated` | `callsign`, `flightPlan` (filed data changed) |
+| `assignedDataChanged` | `callsign`, `field` (`clearedAltitude`, `finalAltitude`, `squawk`, `scratchpad`, `heading`, `speed`, `mach`, `rate`, `directTo`, `communicationType`, `groundState`, `clearance`, `departureSequence`), `flightPlan` |
+| `trackingChanged` | `callsign`, `from`, `to` (empty = not tracked) |
+| `handoffInitiated` | `callsign`, `from`, `to` |
+| `handoffEnded` | `callsign`, `to`, `accepted` |
+| `stripPushed` | `callsign`, `from`, `to` |
+| `aircraftDisconnected` | `callsign` |
+| `controllerConnected` | `controller` |
+| `controllerDisconnected` | `callsign` |
+| `metarUpdated` | `icao`, `metar` |
+| `runwaysChanged` | (the new runways follow in an `airports` message) |
+
+Tracking and handoff events come from comparing ticks, so they arrive with the next push.
+
+### routes (opt-in)
+```json
+{"type":"routes","time":1793660596000,"count":1,"routes":[{"callsign":"SAS107",
+  "points":[{"name":"SIMEG","airway":"","lat":55.9,"lon":13.4,"minutes":4,"altitude":12000,"passed":false}],
+  "predictions":[{"lat":56.3,"lon":13.3,"altitude":9000}]}]}
+```
+`minutes` is the time to the point from now. `predictions` has one position per minute ahead. Subscribe
+to `routes` and, ideally, filter it to the aircraft you care about (see below): routes for everyone are large.
+
+### Sending messages
+Clients send JSON objects with a `cmd`. Every message gets a `{"type":"result","cmd":...,"ok":true}` or
+`{"type":"result","ok":false,"error":"..."}` reply; include an `id` and it is echoed back.
+
+| Message | Effect |
+|---|---|
+| `{"cmd":"subscribe","topics":["aircraft","routes"]}` | Replace your topics (`hello` is always on) |
+| `{"cmd":"filter","tracked":"me"}` | Only aircraft tracked by me (`"any"`: tracked by anyone) |
+| `{"cmd":"filter","area":[55,10,57,15]}` | Only aircraft inside `[minLat, minLon, maxLat, maxLon]` |
+| `{"cmd":"filter","topic":"routes","callsigns":["SAS107"]}` | Filter `routes` (or `aircraft`, the default) by callsign |
+| `{"cmd":"filter"}` | Remove the `aircraft` filter (add `"topic":"routes"` for routes) |
+| `{"cmd":"auth","token":"secret"}` | Authenticate for commands (or add `"token"` to any message) |
+| `{"cmd":"ping"}` | Replies with a result |
+
+Filters can be combined in one message. **Commands** act on EuroScope and only work after
+`.wsdata commands on` (and with the token, if one is set). They run on EuroScope's own thread within
+a second, and EuroScope's usual rules apply: most changes need the aircraft to be tracked by you or nobody.
+
+| Command | Extra fields |
+|---|---|
+| `assume`, `drop`, `acceptHandoff`, `refuseHandoff`, `select` (make it the ASEL) | `callsign` |
+| `handoff` | `callsign`, `to` (controller callsign) |
+| `setClearedAltitude`, `setFinalAltitude` | `callsign`, `value` (ft) |
+| `setHeading`, `setSpeed`, `setRate` | `callsign`, `value` (0 clears) |
+| `setMach` | `callsign`, `value` (0.78 or 78) |
+| `setSquawk` | `callsign`, `value` ("4 octal digits") |
+| `setScratchpad`, `setDirectTo` | `callsign`, `value` (text) |
+| `setCommunicationType` | `callsign`, `value` (`v`, `r` or `t`) |
+| `setAnnotation` | `callsign`, `index` (0-8), `value` |
+| `setRoute` | `callsign`, `value` (new route, amends the flight plan) |
+
+Example: `{"cmd":"setClearedAltitude","callsign":"SAS107","value":7000,"id":1}`. If you bind to
+`0.0.0.0` and enable commands, set a token: anyone who can reach the port could otherwise control your traffic.
 
 ## Map viewer
 `clients/viewer.html` connects automatically and shows every aircraft as a plane icon rotated to its
 heading, with callsign, level and speed labels and a short trail. Tracked aircraft are green. Click a
-plane or a table row to select it (popup with details, "Follow selected" keeps it centred).
+plane or a table row to select it (popup with flight plan details, "Follow selected" keeps it centred);
+the selected aircraft's planned route is drawn as a dashed line. Below the table are the online
+controllers, airports with METAR and active runways, and a log of events.
 
 "Smooth motion" (on by default): EuroScope only gets a new position every few seconds, so between
 reports the viewer moves each plane along its track at its ground speed. Track comes from the last two
@@ -109,11 +229,15 @@ The icon uses the reported (magnetic) heading, so it can be a few degrees off tr
 
 ## Test without EuroScope
 `fake_feed [port] [aircraftCount] [radarSeconds]` serves the same JSON with moving fake aircraft, on Windows or Linux.
-Like EuroScope it sends every second, but positions only change every `radarSeconds` (default 5):
+Like EuroScope it sends every second, but positions only change every `radarSeconds` (default 5).
+It also sends fake controllers, an airport, routes and events, and accepts a subset of the commands
+(always enabled, no token) so you can try them:
 ```
 cmake -S . -B build && cmake --build build   # Linux / macOS
 ./build/fake_feed 8765 8
 python clients/test_client.py
+python clients/test_client.py --send='{"cmd":"assume","callsign":"SAS100"}'
+python clients/test_client.py --topics=routes --raw
 ```
 
 ## CI and releases
@@ -148,8 +272,8 @@ a Linux `fake_feed` binary and `SHA256SUMS.txt`.
 ## Status / known limits
 - The server, JSON and clients were tested end to end on Linux with the fake feed (20 concurrent
   clients, ping/pong, 600 aircraft / 260 KB messages, the browser viewer).
-- `Plugin.cpp` was compile-checked against a stand-in header, not the real SDK, and has not been run
-  inside EuroScope yet. If a getter name differs in your SDK version, the compiler will point at it;
-  `GetGroundState()` is the most likely candidate, and that line can simply be removed.
-- No auth or TLS (`ws://` only). Keep the default `127.0.0.1` bind unless you trust the network.
+- CI builds `Plugin.cpp` against the real SDK. The protocol 2 data (controllers, airports, events,
+  routes, commands) has been tested with the fake feed but not yet inside a live EuroScope session.
+- No TLS (`ws://` only), and the command token is sent in clear text. Keep the default `127.0.0.1`
+  bind unless you trust the network.
 - Up to ~60 clients (Winsock `select()` limit), far more than needed for this.
