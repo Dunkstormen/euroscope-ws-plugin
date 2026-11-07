@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: Version string baked into the plugin
+        type: string
+        default: ""
+      require-plugin:
+        description: Fail instead of skipping the DLL when the SDK secret is missing
+        type: boolean
+        default: false
+    secrets:
+      EUROSCOPE_SDK:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    name: Linux (fake_feed + smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Smoke test
+        run: |
+          pip install websockets
+          python -m py_compile clients/serve.py clients/test_client.py
+          python scripts/smoke_test.py build/fake_feed
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fake_feed-linux-x64
+          path: build/fake_feed
+          if-no-files-found: error
+
+  windows:
+    name: Windows (Win32 plugin DLL)
+    runs-on: windows-latest
+    env:
+      HAS_SDK: ${{ secrets.EUROSCOPE_SDK != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The EuroScope SDK can't be redistributed, so it lives in a repository secret
+      # (base64 of a .tar.gz with EuroScopePlugIn.h and EuroScopePlugInDll.lib). See README.
+      - name: Unpack EuroScope SDK
+        if: env.HAS_SDK == 'true'
+        shell: bash
+        env:
+          EUROSCOPE_SDK: ${{ secrets.EUROSCOPE_SDK }}
+        run: |
+          printf '%s' "$EUROSCOPE_SDK" | base64 -d > "$RUNNER_TEMP/sdk.tgz"
+          tar -xzf "$RUNNER_TEMP/sdk.tgz" -C sdk
+          rm "$RUNNER_TEMP/sdk.tgz"
+          test -f sdk/EuroScopePlugIn.h && test -f sdk/EuroScopePlugInDll.lib
+
+      - name: SDK missing
+        if: env.HAS_SDK != 'true'
+        shell: bash
+        env:
+          REQUIRE_PLUGIN: ${{ inputs.require-plugin }}
+        run: |
+          if [ "$REQUIRE_PLUGIN" = "true" ]; then
+            echo "::error::EUROSCOPE_SDK secret is not set; the release needs the plugin DLL."
+            exit 1
+          fi
+          echo "::warning::EUROSCOPE_SDK secret not available (e.g. a PR from a fork). Building fake_feed only."
+
+      - name: Configure
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          args=(-DES_BUILD_PLUGIN=$([ "$HAS_SDK" = true ] && echo ON || echo OFF))
+          # Tag v1.2.3 -> plugin version 1.2.3
+          if [ -n "$VERSION" ]; then args+=("-DWSDATA_VERSION=${VERSION#v}"); fi
+          cmake -S . -B build -A Win32 "${args[@]}"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Check DLL is 32-bit
+        if: env.HAS_SDK == 'true'
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("build/Release/WsDataPlugin.dll")
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          if ($machine -ne 0x14c) { throw ("Expected x86 (0x14c), got 0x{0:x}" -f $machine) }
+          Write-Host "WsDataPlugin.dll is x86"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Smoke test
+        run: |
+          pip install websockets
+          python scripts/smoke_test.py build/Release/fake_feed.exe
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/WsDataPlugin/clients
+          cp build/Release/fake_feed.exe dist/WsDataPlugin/
+          if [ -f build/Release/WsDataPlugin.dll ]; then cp build/Release/WsDataPlugin.dll dist/WsDataPlugin/; fi
+          cp clients/viewer.html clients/serve.py clients/test_client.py dist/WsDataPlugin/clients/
+          cp README.md dist/WsDataPlugin/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WsDataPlugin-win32
+          path: dist/WsDataPlugin
+          if-no-files-found: error

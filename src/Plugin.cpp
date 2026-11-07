@@ -33,7 +33,10 @@
 namespace {
 
 const char* kName = "WebSocket Data";
-const char* kVersion = "0.1.0";
+#ifndef WSDATA_VERSION
+#define WSDATA_VERSION "0.1.0"
+#endif
+const char* kVersion = WSDATA_VERSION;
 const char* kAuthor = "Benjamin";
 const char* kCommand = ".wsdata";
 

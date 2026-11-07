@@ -23,6 +23,8 @@ The SDK is only ever called from EuroScope's own thread.
 | `clients/viewer.html` | Browser viewer: live map (MapLibre + Protomaps) and table |
 | `clients/serve.py` | Serves the viewer and a local `map.pmtiles` basemap (range requests) |
 | `clients/test_client.py` | Terminal client (`pip install websockets`) |
+| `scripts/smoke_test.py` | CI check: runs `fake_feed` and validates a snapshot over WebSocket |
+| `.github/workflows/` | CI (build + smoke test) and tag-triggered releases |
 | `sdk/` | Put `EuroScopePlugIn.h` and `EuroScopePlugInDll.lib` here (not included) |
 
 ## Build (Windows)
@@ -113,6 +115,35 @@ cmake -S . -B build && cmake --build build   # Linux / macOS
 ./build/fake_feed 8765 8
 python clients/test_client.py
 ```
+
+## CI and releases
+GitHub Actions (`.github/workflows/`) run on every push to `main` and every pull request:
+- **Linux**: builds `fake_feed` and runs `scripts/smoke_test.py` (starts the feed, connects over
+  WebSocket, checks one snapshot).
+- **Windows**: builds the 32-bit plugin DLL (`-A Win32`, checked to really be x86) plus `fake_feed.exe`,
+  runs the same smoke test, and uploads a `WsDataPlugin-win32` build artifact.
+
+The EuroScope SDK can't be committed, so CI reads it from a repository secret called `EUROSCOPE_SDK`:
+a base64-encoded `.tar.gz` holding `EuroScopePlugIn.h` and `EuroScopePlugInDll.lib`. Set it once
+from this folder, with the SDK files in `sdk/` and the GitHub CLI signed in (PowerShell):
+```
+tar -czf sdk.tgz -C sdk EuroScopePlugIn.h EuroScopePlugInDll.lib
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\sdk.tgz")) | gh secret set EUROSCOPE_SDK
+del sdk.tgz
+```
+(Or paste the base64 text under Settings -> Secrets and variables -> Actions. Secrets max out at 48 KB,
+which the compressed SDK fits in.) Without the secret, for example on pull requests from forks, the
+Windows job still builds and tests `fake_feed.exe` and skips the DLL with a warning.
+
+**Releasing**: push a version tag. The tag becomes the version EuroScope shows (`v0.2.0` -> `0.2.0`);
+tags with a dash such as `v0.2.0-rc1` are marked as pre-releases.
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
+The Release workflow rebuilds everything, fails if the SDK secret is missing, and publishes a GitHub
+Release with generated notes and `WsDataPlugin-<tag>-win32.zip` (DLL, `fake_feed.exe`, clients, README),
+a Linux `fake_feed` binary and `SHA256SUMS.txt`.
 
 ## Status / known limits
 - The server, JSON and clients were tested end to end on Linux with the fake feed (20 concurrent

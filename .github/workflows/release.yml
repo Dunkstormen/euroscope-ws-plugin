@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ github.ref_name }}
+      require-plugin: true
+    secrets: inherit
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package assets
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          (cd artifacts/WsDataPlugin-win32 && zip -r "../../WsDataPlugin-${tag}-win32.zip" .)
+          cp artifacts/fake_feed-linux-x64/fake_feed "fake_feed-${tag}-linux-x64"
+          chmod +x "fake_feed-${tag}-linux-x64"
+          sha256sum WsDataPlugin-*.zip fake_feed-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          flags=(--generate-notes --title "$tag")
+          case "$tag" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" "${flags[@]}" \
+            "WsDataPlugin-${tag}-win32.zip" "fake_feed-${tag}-linux-x64" SHA256SUMS.txt
