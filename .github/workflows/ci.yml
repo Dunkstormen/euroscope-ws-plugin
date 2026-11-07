@@ -68,7 +68,7 @@ jobs:
 
       # The EuroScope SDK can't be redistributed, so it lives in a repository secret:
       # base64 of a tar archive (xz or gzip) with EuroScopePlugIn.h and EuroScopePlugInDll.lib.
-      # xz is needed to fit GitHub's 48 KB secret limit. See README.
+      # xz is needed to fit GitHub's 48 KB secret limit. See docs/development.md.
       - name: Unpack EuroScope SDK
         if: env.HAS_SDK == 'true'
         shell: bash
@@ -128,7 +128,7 @@ jobs:
           cp build/Release/fake_feed.exe dist/WsDataPlugin/
           if [ -f build/Release/WsDataPlugin.dll ]; then cp build/Release/WsDataPlugin.dll dist/WsDataPlugin/; fi
           cp clients/viewer.html clients/serve.py clients/test_client.py dist/WsDataPlugin/clients/
-          cp README.md dist/WsDataPlugin/
+          cp -r README.md docs dist/WsDataPlugin/
 
       - uses: actions/upload-artifact@v7
         with:
