@@ -16,7 +16,6 @@ testing clients without EuroScope.
 - **Stream overlays** for Twitch or YouTube showing your traffic, METAR and runways.
 - **Stand, gate or slot tools** fed from flight plans and ground states.
 - **Statistics and logging**: movements per hour, handoff times, session reports.
-- **Training and mentoring**: let a mentor watch a student's traffic and events live.
 - **Stream Deck or hardware panels** that send commands such as assume or handoff.
 - **Alerts and automation**: notify when an aircraft enters your sector, squawks an emergency code or a METAR changes.
 
