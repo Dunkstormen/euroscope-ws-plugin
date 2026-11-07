@@ -124,16 +124,16 @@ GitHub Actions (`.github/workflows/`) run on every push to `main` and every pull
   runs the same smoke test, and uploads a `WsDataPlugin-win32` build artifact.
 
 The EuroScope SDK can't be committed, so CI reads it from a repository secret called `EUROSCOPE_SDK`:
-a base64-encoded `.tar.gz` holding `EuroScopePlugIn.h` and `EuroScopePlugInDll.lib`. Set it once
-from this folder, with the SDK files in `sdk/` and the GitHub CLI signed in (PowerShell):
+base64 of an xz-compressed tar holding `EuroScopePlugIn.h` and `EuroScopePlugInDll.lib`. xz matters:
+secrets max out at 48 KB, and the 3.2.x SDK is about 42 KB this way but about 60 KB with gzip.
+Create the value from this folder in Git Bash (or WSL/Linux), with the SDK files in `sdk/`:
 ```
-tar -czf sdk.tgz -C sdk EuroScopePlugIn.h EuroScopePlugInDll.lib
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\sdk.tgz")) | gh secret set EUROSCOPE_SDK
-del sdk.tgz
+tar -cf - -C sdk EuroScopePlugIn.h EuroScopePlugInDll.lib | xz -9e | base64 -w0 > sdk/EUROSCOPE_SDK-secret.txt
 ```
-(Or paste the base64 text under Settings -> Secrets and variables -> Actions. Secrets max out at 48 KB,
-which the compressed SDK fits in.) Without the secret, for example on pull requests from forks, the
-Windows job still builds and tests `fake_feed.exe` and skips the DLL with a warning.
+Paste the file's contents into Settings -> Secrets and variables -> Actions -> New repository secret
+(or run `gh secret set EUROSCOPE_SDK < sdk/EUROSCOPE_SDK-secret.txt`), then delete the file.
+Without the secret, for example on pull requests from forks, the Windows job still builds and tests
+`fake_feed.exe` and skips the DLL with a warning.
 
 **Releasing**: push a version tag. The tag becomes the version EuroScope shows (`v0.2.0` -> `0.2.0`);
 tags with a dash such as `v0.2.0-rc1` are marked as pre-releases.

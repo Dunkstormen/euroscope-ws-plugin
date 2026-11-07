@@ -62,17 +62,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The EuroScope SDK can't be redistributed, so it lives in a repository secret
-      # (base64 of a .tar.gz with EuroScopePlugIn.h and EuroScopePlugInDll.lib). See README.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The EuroScope SDK can't be redistributed, so it lives in a repository secret:
+      # base64 of a tar archive (xz or gzip) with EuroScopePlugIn.h and EuroScopePlugInDll.lib.
+      # xz is needed to fit GitHub's 48 KB secret limit. See README.
       - name: Unpack EuroScope SDK
         if: env.HAS_SDK == 'true'
         shell: bash
         env:
           EUROSCOPE_SDK: ${{ secrets.EUROSCOPE_SDK }}
         run: |
-          printf '%s' "$EUROSCOPE_SDK" | base64 -d > "$RUNNER_TEMP/sdk.tgz"
-          tar -xzf "$RUNNER_TEMP/sdk.tgz" -C sdk
-          rm "$RUNNER_TEMP/sdk.tgz"
+          printf '%s' "$EUROSCOPE_SDK" | base64 -d > "$RUNNER_TEMP/sdk.tar"
+          python -c "import sys, tarfile; tarfile.open(sys.argv[1]).extractall('sdk', filter='data')" "$RUNNER_TEMP/sdk.tar"
+          rm "$RUNNER_TEMP/sdk.tar"
           test -f sdk/EuroScopePlugIn.h && test -f sdk/EuroScopePlugInDll.lib
 
       - name: SDK missing
@@ -109,10 +114,6 @@ jobs:
           $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
           if ($machine -ne 0x14c) { throw ("Expected x86 (0x14c), got 0x{0:x}" -f $machine) }
           Write-Host "WsDataPlugin.dll is x86"
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Smoke test
         run: |
