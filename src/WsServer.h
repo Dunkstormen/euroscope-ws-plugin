@@ -54,7 +54,8 @@ public:
 
     // Called on the server thread for every text message a client sends.
     void SetMessageHandler(MessageHandler handler);
-    // Called on the server thread when a client that completed the handshake goes away.
+    // Called on the server thread when a client that completed the handshake goes away,
+    // including clients closed by Stop().
     void SetCloseHandler(CloseHandler handler);
 
     size_t ClientCount() const { return clientCount_; }
@@ -74,6 +75,7 @@ private:
     std::atomic<size_t> clientCount_{0};
     uint16_t port_ = 0;
     intptr_t listenSocket_ = -1;
+    ClientId nextClientId_ = 1;  // server thread only; kept across Stop()/Start()
 
     std::mutex mutex_;  // guards the fields below
     std::vector<Outgoing> pending_;

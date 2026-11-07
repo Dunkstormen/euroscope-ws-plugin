@@ -342,7 +342,6 @@ void WsServer::Run() {
     socket_t listener = socket_t(listenSocket_);
     std::vector<Client> clients;
     char buf[16384];
-    ClientId nextId = 1;
 
     while (running_) {
         // 1. Pick up messages queued by the plugin thread.
@@ -390,7 +389,7 @@ void WsServer::Run() {
                 int one = 1;
                 setsockopt(ns, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
                 Client c;
-                c.id = nextId++;
+                c.id = nextClientId_++;  // never reused, even across restarts
                 c.sock = ns;
                 clients.push_back(std::move(c));
             }
@@ -451,14 +450,20 @@ void WsServer::Run() {
         clientCount_ = size_t(std::count_if(clients.begin(), clients.end(), [](const Client& c) { return c.open; }));
     }
 
+    CloseHandler closeHandler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closeHandler = closeHandler_;
+        subscriptions_.clear();
+        pending_.clear();
+    }
     for (Client& c : clients) {
         if (c.open) {
             std::string bye = MakeFrame(0x8, std::string("\x03\xE9", 2));  // 1001 going away
             send(c.sock, bye.data(), int(bye.size()), SEND_FLAGS);
         }
         CloseSock(c.sock);
+        // Let the owner drop per-client state (auth, filters) for clients closed by Stop().
+        if (c.open && closeHandler) closeHandler(c.id);
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    subscriptions_.clear();
-    pending_.clear();
 }
