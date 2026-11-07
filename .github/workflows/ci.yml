@@ -31,14 +31,14 @@ jobs:
     name: Linux (fake_feed + smoke test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure and build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wall -Wextra" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
           cmake --build build --parallel
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -48,7 +48,7 @@ jobs:
           python -m py_compile clients/serve.py clients/test_client.py
           python scripts/smoke_test.py build/fake_feed
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fake_feed-linux-x64
           path: build/fake_feed
@@ -60,9 +60,9 @@ jobs:
     env:
       HAS_SDK: ${{ secrets.EUROSCOPE_SDK != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -100,7 +100,8 @@ jobs:
           args=(-DES_BUILD_PLUGIN=$([ "$HAS_SDK" = true ] && echo ON || echo OFF))
           # Tag v1.2.3 -> plugin version 1.2.3
           if [ -n "$VERSION" ]; then args+=("-DWSDATA_VERSION=${VERSION#v}"); fi
-          cmake -S . -B build -A Win32 "${args[@]}"
+          # Warnings fail CI so they can't pile up again (local builds are unaffected).
+          cmake -S . -B build -A Win32 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON "${args[@]}"
 
       - name: Build
         run: cmake --build build --config Release --parallel
@@ -129,7 +130,7 @@ jobs:
           cp clients/viewer.html clients/serve.py clients/test_client.py dist/WsDataPlugin/clients/
           cp README.md dist/WsDataPlugin/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: WsDataPlugin-win32
           path: dist/WsDataPlugin
