@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EuroScope WS viewer</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/pmtiles@4.5.0/dist/pmtiles.js"></script>
+<script src="https://unpkg.com/@protomaps/basemaps@5.7.2/dist/basemaps.js"></script>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f7f9; --fg:#1b1f24; --muted:#6a737d; --line:#d8dde3; --ok:#1a7f37; --bad:#cf222e; --sel:#fff4d1; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1216; --fg:#e6e9ee; --muted:#8b949e; --line:#2a313a; --ok:#3fb950; --bad:#f85149; --sel:#3a3115; } }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; display:flex; flex-direction:column; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); }
+  input { padding:6px 8px; font:inherit; background:transparent; color:inherit; border:1px solid var(--line); border-radius:6px; }
+  #url { flex:1; min-width:180px; }
+  button { padding:6px 12px; font:inherit; border-radius:6px; border:1px solid var(--line); background:transparent; color:inherit; cursor:pointer; }
+  #status { color:var(--muted); }
+  #status.ok { color:var(--ok); } #status.bad { color:var(--bad); }
+  details.settings { padding:0 16px; }
+  details.settings summary { cursor:pointer; color:var(--muted); padding:6px 0; }
+  .settings-grid { display:grid; grid-template-columns:auto 1fr; gap:6px 10px; align-items:center; padding-bottom:10px; max-width:720px; }
+  .settings-grid input { width:100%; }
+  .hint { grid-column:1 / -1; color:var(--muted); font-size:12px; }
+  main { flex:1; min-height:0; display:flex; flex-direction:column; }
+  #map { flex:3; min-height:280px; }
+  .wrap { flex:2; min-height:120px; overflow:auto; border-top:1px solid var(--line); }
+  @media (min-width: 1100px) { main { flex-direction:row; } #map { flex:3; } .wrap { flex:2; border-top:0; border-left:1px solid var(--line); } }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--bg); }
+  td.n { text-align:right; }
+  tbody tr { cursor:pointer; }
+  tbody tr.sel { background:var(--sel); }
+  .maplibregl-popup-content { font:12px/1.4 system-ui, sans-serif; color:#1b1f24; }
+  .maplibregl-popup-content b { font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <input id="url" value="ws://127.0.0.1:8765" aria-label="WebSocket URL">
+  <button id="connect">Connect</button>
+  <label><input type="checkbox" id="smooth" checked> Smooth motion</label>
+  <label><input type="checkbox" id="follow"> Follow selected</label>
+  <span id="status">disconnected</span>
+</header>
+<details class="settings">
+  <summary>Map settings</summary>
+  <div class="settings-grid">
+    <label for="apikey">Protomaps API key</label><input id="apikey" placeholder="optional">
+    <label for="pmtiles">PMTiles URL</label><input id="pmtiles" placeholder="auto: local map.pmtiles, else Protomaps demo">
+    <span class="hint">Leave both empty to use <code>map.pmtiles</code> next to this page (run <code>serve.py</code>, see README),
+      falling back to Protomaps' public demo file. With an API key, tiles come from the Protomaps API instead.</span>
+    <span></span><div><button id="apply">Apply</button></div>
+  </div>
+</details>
+<main>
+  <div id="map"></div>
+  <div class="wrap">
+    <table>
+      <thead><tr>
+        <th>Callsign</th><th>Alt</th><th>GS</th><th>Hdg</th><th>V/S</th><th>Sqk</th><th>Type</th>
+        <th>ADEP</th><th>ADES</th><th>CFL</th><th>Tracked by</th><th>Lat</th><th>Lon</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</main>
+<script>
+"use strict";
+const DEFAULT_PMTILES = "https://demo-bucket.protomaps.com/v4.pmtiles";
+const TRAIL_POINTS = 30;
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const store = {
+  get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// ---- settings (URL ?ws=…&key=…&pmtiles=… overrides saved values) ----
+const params = new URLSearchParams(location.search);
+$("url").value = params.get("ws") || store.get("ws", $("url").value);
+$("apikey").value = params.get("key") || store.get("apikey", "");
+$("pmtiles").value = params.get("pmtiles") || store.get("pmtiles", "");
+let autoPmtiles = DEFAULT_PMTILES;  // replaced by local map.pmtiles if it exists
+
+// ---- map ----
+const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+const protocol = new pmtiles.Protocol();
+maplibregl.addProtocol("pmtiles", protocol.tile);
+
+function basemapStyle() {
+  const key = $("apikey").value.trim();
+  const source = key
+    ? { type: "vector", url: `https://api.protomaps.com/tiles/v4.json?key=${encodeURIComponent(key)}`,
+        attribution: '<a href="https://protomaps.com">Protomaps</a> © <a href="https://openstreetmap.org">OpenStreetMap</a>' }
+    : { type: "vector", url: "pmtiles://" + ($("pmtiles").value.trim() || autoPmtiles),
+        attribution: '<a href="https://protomaps.com">Protomaps</a> © <a href="https://openstreetmap.org">OpenStreetMap</a>' };
+  const flavor = dark ? "dark" : "light";
+  return {
+    version: 8,
+    glyphs: "https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf",
+    sprite: `https://protomaps.github.io/basemaps-assets/sprites/v4/${flavor}`,
+    sources: { protomaps: source },
+    layers: basemaps.layers("protomaps", basemaps.namedFlavor(flavor), { lang: "en" }),
+  };
+}
+
+// Start with an empty style; the basemap is set once we know whether a local map.pmtiles exists.
+const map = new maplibregl.Map({
+  container: "map", center: [12.6, 55.6], zoom: 6,
+  style: { version: 8, glyphs: "https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf", sources: {},
+           layers: [{ id: "bg", type: "background", paint: { "background-color": dark ? "#1e2125" : "#dcdcdc" } }] },
+});
+(async () => {
+  if (location.protocol.startsWith("http")) {
+    try {
+      const local = new URL("map.pmtiles", location.href).href;
+      const r = await fetch(local, { headers: { Range: "bytes=0-6" } });
+      if (r.ok && (await r.text()).startsWith("PMTiles")) autoPmtiles = local;
+    } catch {}
+  }
+  map.setStyle(basemapStyle(), { diff: false });
+})();
+map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
+map.addControl(new maplibregl.ScaleControl({ unit: "nautical" }));
+
+// Plane icon drawn on a canvas, nose pointing north so icon-rotate = heading.
+function planeIcon(fill, stroke) {
+  const size = 64, c = document.createElement("canvas");
+  c.width = c.height = size;
+  const g = c.getContext("2d");
+  g.translate(size / 2, size / 2);
+  g.scale(size / 64, size / 64);
+  g.beginPath();
+  g.moveTo(0, -28);                       // nose
+  g.bezierCurveTo(3, -28, 4, -22, 4, -16);
+  g.lineTo(4, -6); g.lineTo(28, 6); g.lineTo(28, 11); g.lineTo(4, 5);   // right wing
+  g.lineTo(3, 18); g.lineTo(11, 24); g.lineTo(11, 28); g.lineTo(0, 25); // right tail
+  g.lineTo(-11, 28); g.lineTo(-11, 24); g.lineTo(-3, 18);              // left tail
+  g.lineTo(-4, 5); g.lineTo(-28, 11); g.lineTo(-28, 6); g.lineTo(-4, -6); // left wing
+  g.lineTo(-4, -16);
+  g.bezierCurveTo(-4, -22, -3, -28, 0, -28);
+  g.closePath();
+  g.fillStyle = fill; g.fill();
+  g.lineWidth = 3; g.strokeStyle = stroke; g.stroke();
+  return g.getImageData(0, 0, size, size);
+}
+
+const emptyFC = () => ({ type: "FeatureCollection", features: [] });
+
+function addAircraftLayers() {
+  // Re-added after every style change (setStyle wipes custom layers).
+  const imgs = {
+    "plane": planeIcon(dark ? "#e8c547" : "#1f5fbf", dark ? "#111" : "#fff"),
+    "plane-tracked": planeIcon(dark ? "#3fb950" : "#1a7f37", dark ? "#111" : "#fff"),
+    "plane-selected": planeIcon("#ff7a00", dark ? "#111" : "#fff"),
+  };
+  for (const [name, img] of Object.entries(imgs))
+    if (!map.hasImage(name)) map.addImage(name, img, { pixelRatio: 2 });
+
+  if (!map.getSource("trails")) map.addSource("trails", { type: "geojson", data: emptyFC() });
+  if (!map.getSource("aircraft")) map.addSource("aircraft", { type: "geojson", data: emptyFC() });
+
+  if (!map.getLayer("trails")) map.addLayer({
+    id: "trails", type: "line", source: "trails",
+    paint: { "line-color": dark ? "#e8c547" : "#1f5fbf", "line-width": 1.5, "line-opacity": 0.45 },
+  });
+  if (!map.getLayer("aircraft")) map.addLayer({
+    id: "aircraft", type: "symbol", source: "aircraft",
+    layout: {
+      "icon-image": ["case", ["get", "selected"], "plane-selected", ["get", "tracked"], "plane-tracked", "plane"],
+      "icon-size": ["interpolate", ["linear"], ["zoom"], 4, 0.6, 10, 1],
+      "icon-rotate": ["get", "heading"],
+      "icon-rotation-alignment": "map",
+      "icon-allow-overlap": true,
+      "icon-ignore-placement": true,
+      "text-field": ["concat", ["get", "callsign"], "\n", ["get", "label2"]],
+      "text-font": ["Noto Sans Medium"],
+      "text-size": 11,
+      "text-anchor": "left",
+      "text-offset": [1.4, 0],
+      "text-justify": "left",
+      "text-allow-overlap": true,
+      "text-optional": true,
+    },
+    paint: {
+      "text-color": dark ? "#e6e9ee" : "#1b1f24",
+      "text-halo-color": dark ? "#0f1216" : "#ffffff",
+      "text-halo-width": 1.5,
+    },
+  });
+}
+
+map.on("style.load", () => { addAircraftLayers(); render(); });
+map.on("error", e => console.warn("map:", e.error?.message || e));
+
+// ---- state ----
+let ws = null;
+let latest = null;                 // last message from the server
+const trails = new Map();          // callsign -> [[lon, lat], ...]
+let selected = store.get("selected", "") || null;
+let fitted = false;
+
+function fl(a) { return a.altitude >= 6000 ? "FL" + String(Math.round(a.flightLevel / 100)).padStart(3, "0") : a.altitude + "ft"; }
+
+function render() {
+  if (!latest) return;
+  const list = latest.aircraft;
+  const alive = new Set();
+  for (const a of list) {
+    alive.add(a.callsign);
+    const t = trails.get(a.callsign) || [];
+    const last = t[t.length - 1];
+    if (!last || last[0] !== a.lon || last[1] !== a.lat) t.push([a.lon, a.lat]);
+    if (t.length > TRAIL_POINTS) t.shift();
+    trails.set(a.callsign, t);
+  }
+  for (const k of trails.keys()) if (!alive.has(k)) trails.delete(k);
+  for (const k of motion.keys()) if (!alive.has(k)) motion.delete(k);
+  const now = performance.now();
+  for (const a of list) updateMotion(a, now);
+
+  if (!fitted && list.length) {
+    fitted = true;
+    const b = new maplibregl.LngLatBounds();
+    list.forEach(a => b.extend([a.lon, a.lat]));
+    map.fitBounds(b, { padding: 60, maxZoom: 9, duration: 0 });
+  }
+  const sel = list.find(a => a.callsign === selected);
+  if (popup && popup.isOpen() && sel) popup.setHTML(popupHtml(sel));
+  drawFrame(performance.now());
+
+  $("rows").innerHTML = [...list]
+    .sort((a, b) => a.callsign.localeCompare(b.callsign))
+    .map(a => {
+      const f = a.flightPlan || {};
+      return `<tr data-cs="${esc(a.callsign)}" class="${a.callsign === selected ? "sel" : ""}">
+        <td>${esc(a.callsign)}</td><td class="n">${a.altitude}</td><td class="n">${a.groundSpeed}</td>
+        <td class="n">${a.heading}</td><td class="n">${a.verticalSpeed}</td><td>${esc(a.squawk)}</td>
+        <td>${esc(f.aircraftType)}</td><td>${esc(f.origin)}</td><td>${esc(f.destination)}</td>
+        <td class="n">${f.clearedAltitude || ""}</td><td>${esc(f.trackingController)}</td>
+        <td class="n">${a.lat.toFixed(4)}</td><td class="n">${a.lon.toFixed(4)}</td></tr>`;
+    }).join("");
+}
+
+// ---- motion: dead reckoning between reports ----
+// EuroScope only gets a new position every few seconds (the plugin re-sends the same one every
+// second in between). Between reports each plane is moved along its track at its ground speed.
+// When a new report arrives, the gap between where we drew the plane and where it really is gets
+// blended out over BLEND_MS instead of snapping.
+const BLEND_MS = 1500;          // time to absorb a correction
+const MAX_EXTRAPOLATE_MS = 15000; // stop guessing if reports stop coming
+const SNAP_NM = 3;              // corrections bigger than this snap (new target, teleport, etc.)
+const motion = new Map();       // callsign -> state
+
+const toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
+const angDiff = (a, b) => ((b - a + 540) % 360) - 180;          // signed shortest turn a -> b
+function bearing(lat1, lon1, lat2, lon2) {
+  const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2));
+  const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) - Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1));
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+function distNm(lat1, lon1, lat2, lon2) {
+  const dLat = (lat2 - lat1) * 60, dLon = (lon2 - lon1) * 60 * Math.cos(toRad((lat1 + lat2) / 2));
+  return Math.hypot(dLat, dLon);
+}
+
+function updateMotion(a, now) {
+  const m = motion.get(a.callsign);
+  if (m && m.lat === a.lat && m.lon === a.lon) { m.gs = a.groundSpeed; return; }  // same report repeated
+  const shown = m ? predict(m, now) : null;
+  // Track over ground from the last two reports (true north, includes wind); else reported heading.
+  let track = a.heading;
+  if (m && distNm(m.lat, m.lon, a.lat, a.lon) > 0.02) track = bearing(m.lat, m.lon, a.lat, a.lon);
+  const n = { lat: a.lat, lon: a.lon, t: now, gs: a.groundSpeed, track, offLat: 0, offLon: 0, hdgFrom: track };
+  if (shown && distNm(shown.lat, shown.lon, a.lat, a.lon) < SNAP_NM) {
+    n.offLat = shown.lat - a.lat;
+    n.offLon = shown.lon - a.lon;
+    n.hdgFrom = shown.hdg;
+  }
+  motion.set(a.callsign, n);
+}
+
+function predict(m, now) {
+  const age = now - m.t;
+  const dt = Math.min(age, MAX_EXTRAPOLATE_MS) / 1000;
+  const k = Math.max(0, 1 - age / BLEND_MS);
+  const e = k * k * (3 - 2 * k);                     // smoothstep easing of the correction
+  const degPerSec = m.gs >= 5 ? m.gs / 3600 / 60 : 0;
+  const lat = m.lat + degPerSec * Math.cos(toRad(m.track)) * dt + m.offLat * e;
+  const lon = m.lon + degPerSec * Math.sin(toRad(m.track)) * dt / Math.cos(toRad(m.lat)) + m.offLon * e;
+  const hdg = (m.track - angDiff(m.hdgFrom, m.track) * e + 360) % 360;
+  return { lat, lon, hdg };
+}
+
+function displayed(a, now) {
+  const m = motion.get(a.callsign);
+  if (!$("smooth").checked || !m) return { lat: a.lat, lon: a.lon, hdg: a.heading };
+  return predict(m, now);
+}
+
+function drawFrame(now) {
+  if (!latest) return;
+  const ac = map.getSource("aircraft"), tr = map.getSource("trails");
+  const pos = new Map(latest.aircraft.map(a => [a.callsign, displayed(a, now)]));
+  if (ac) ac.setData({
+    type: "FeatureCollection",
+    features: latest.aircraft.map(a => {
+      const p = pos.get(a.callsign);
+      return {
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [p.lon, p.lat] },
+        properties: {
+          callsign: a.callsign, heading: p.hdg,
+          label2: `${fl(a)} ${a.groundSpeed}kt`,
+          tracked: !!(a.flightPlan && a.flightPlan.trackingController),
+          selected: a.callsign === selected,
+        },
+      };
+    }),
+  });
+  if (tr) tr.setData({
+    type: "FeatureCollection",
+    features: [...trails.entries()].map(([cs, t]) => {
+      const p = pos.get(cs);
+      return { type: "Feature", geometry: { type: "LineString", coordinates: p ? [...t, [p.lon, p.lat]] : t }, properties: { callsign: cs } };
+    }).filter(f => f.geometry.coordinates.length > 1),
+  });
+  const sp = selected && pos.get(selected);
+  if (sp) {
+    if (popup && popup.isOpen()) popup.setLngLat([sp.lon, sp.lat]);
+    if ($("follow").checked && !map.isMoving()) map.setCenter([sp.lon, sp.lat]);
+  }
+}
+
+// ~30 fps is plenty for planes and keeps CPU low with many targets.
+let lastFrame = 0;
+function loop(t) {
+  if ($("smooth").checked && t - lastFrame >= 33) { lastFrame = t; drawFrame(performance.now()); }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+$("smooth").onchange = () => drawFrame(performance.now());
+
+// ---- selection / popup ----
+let popup = null;
+function popupHtml(a) {
+  const f = a.flightPlan;
+  return `<b>${esc(a.callsign)}</b> ${f ? esc(f.aircraftType) : ""}<br>
+    ${fl(a)} · ${a.groundSpeed} kt · ${a.heading}° · ${a.verticalSpeed} fpm<br>
+    Squawk ${esc(a.squawk)}${f ? `<br>${esc(f.origin)} → ${esc(f.destination)}${f.clearedAltitude ? ` · CFL ${f.clearedAltitude}` : ""}
+    ${f.trackingController ? `<br>Tracked by ${esc(f.trackingController)}` : ""}` : "<br>No flight plan"}`;
+}
+function select(cs, fly) {
+  selected = cs;
+  store.set("selected", cs || "");
+  const a = latest && latest.aircraft.find(x => x.callsign === cs);
+  if (popup) popup.remove();
+  if (a) {
+    popup = new maplibregl.Popup({ closeButton: true, offset: 14 }).setLngLat([a.lon, a.lat]).setHTML(popupHtml(a)).addTo(map);
+    popup.on("close", () => { if (selected === cs) { selected = null; render(); } });
+    if (fly) map.easeTo({ center: [a.lon, a.lat], zoom: Math.max(map.getZoom(), 8) });
+  }
+  render();
+}
+map.on("click", "aircraft", e => select(e.features[0].properties.callsign, false));
+map.on("mouseenter", "aircraft", () => map.getCanvas().style.cursor = "pointer");
+map.on("mouseleave", "aircraft", () => map.getCanvas().style.cursor = "");
+$("rows").addEventListener("click", e => { const tr = e.target.closest("tr"); if (tr) select(tr.dataset.cs, true); });
+
+// ---- websocket ----
+function setStatus(text, cls) { $("status").textContent = text; $("status").className = cls || ""; }
+function connect() {
+  if (ws) { ws.close(); return; }
+  store.set("ws", $("url").value);
+  ws = new WebSocket($("url").value);
+  $("connect").textContent = "Disconnect";
+  setStatus("connecting…");
+  ws.onopen = () => setStatus("connected", "ok");
+  ws.onclose = () => { setStatus("disconnected", "bad"); $("connect").textContent = "Connect"; ws = null; };
+  ws.onmessage = ev => {
+    const data = JSON.parse(ev.data);
+    if (data.type !== "aircraft") return;
+    latest = data;
+    setStatus(`connected · ${data.count} aircraft · ${data.source || "?"} · ${new Date(data.time).toLocaleTimeString()}`, "ok");
+    render();
+  };
+}
+$("connect").onclick = connect;
+$("apply").onclick = () => {
+  store.set("apikey", $("apikey").value.trim());
+  store.set("pmtiles", $("pmtiles").value.trim());
+  map.setStyle(basemapStyle(), { diff: false });
+};
+connect();
+</script>
+</body>
+</html>
