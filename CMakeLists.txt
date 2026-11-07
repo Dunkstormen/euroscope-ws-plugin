@@ -23,7 +23,10 @@ if(MSVC AND ES_BUILD_PLUGIN)
     endif()
 
     add_library(WsDataPlugin SHARED src/Plugin.cpp src/WsServer.cpp)
-    target_include_directories(WsDataPlugin PRIVATE src "${ES_SDK_DIR}")
+    target_include_directories(WsDataPlugin PRIVATE src)
+    # Treat the SDK as an external header: /W4 would otherwise report ~90 C4100 "unreferenced
+    # parameter" warnings from its default virtual handlers, which we can't change.
+    target_compile_options(WsDataPlugin PRIVATE "/external:I${ES_SDK_DIR}" /external:W0)
     target_link_libraries(WsDataPlugin PRIVATE "${ES_SDK_DIR}/EuroScopePlugInDll.lib" ws2_32)
     target_compile_definitions(WsDataPlugin PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX
         WSDATA_VERSION="${WSDATA_VERSION}")

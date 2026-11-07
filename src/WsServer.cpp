@@ -74,7 +74,7 @@ struct Sha1 {
         Sha1 s;
         std::string data = msg;
         uint64_t bitLen = uint64_t(msg.size()) * 8;
-        data.push_back(char(0x80));
+        data.push_back('\x80');  // padding marker byte; '\x80' avoids MSVC C4310
         while (data.size() % 64 != 56) data.push_back('\0');
         for (int i = 7; i >= 0; --i) data.push_back(char((bitLen >> (i * 8)) & 0xFF));
         for (size_t i = 0; i < data.size(); i += 64) s.Block(reinterpret_cast<const uint8_t*>(data.data() + i));
