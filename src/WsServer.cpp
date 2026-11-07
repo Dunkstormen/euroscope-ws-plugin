@@ -133,6 +133,7 @@ std::string MakeFrame(uint8_t opcode, const std::string& payload) {
 }
 
 struct Client {
+    WsServer::ClientId id = 0;
     socket_t sock = kInvalidSocket;
     bool open = false;          // handshake done
     bool closing = false;       // flush outBuf, then close
@@ -287,10 +288,44 @@ void WsServer::Stop() {
 #endif
 }
 
-void WsServer::Broadcast(const std::string& text) {
+void WsServer::Publish(const std::string& topic, const std::string& text, bool retain) {
     std::lock_guard<std::mutex> lock(mutex_);
-    pending_.push_back(text);
-    lastMessage_ = text;
+    pending_.push_back({topic, 0, text});
+    if (!retain) return;
+    for (auto& r : retained_)
+        if (r.first == topic) { r.second = text; return; }
+    retained_.emplace_back(topic, text);
+}
+
+void WsServer::SendTo(ClientId client, const std::string& text) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_.push_back({std::string(), client, text});
+}
+
+void WsServer::Subscribe(ClientId client, const std::set<std::string>& topics) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = subscriptions_.find(client);
+    if (it == subscriptions_.end()) return;  // gone
+    for (const auto& r : retained_)
+        if (topics.count(r.first) && !it->second.count(r.first)) pending_.push_back({std::string(), client, r.second});
+    it->second = topics;
+}
+
+void WsServer::SetDefaultTopics(const std::set<std::string>& topics) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    defaultTopics_ = topics;
+}
+
+bool WsServer::HasSubscribers(const std::string& topic) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& s : subscriptions_)
+        if (s.second.count(topic)) return true;
+    return false;
+}
+
+void WsServer::ClearRetained() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    retained_.clear();
 }
 
 void WsServer::SetMessageHandler(MessageHandler handler) {
@@ -298,26 +333,36 @@ void WsServer::SetMessageHandler(MessageHandler handler) {
     handler_ = std::move(handler);
 }
 
+void WsServer::SetCloseHandler(CloseHandler handler) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    closeHandler_ = std::move(handler);
+}
+
 void WsServer::Run() {
     socket_t listener = socket_t(listenSocket_);
     std::vector<Client> clients;
     char buf[16384];
+    ClientId nextId = 1;
 
     while (running_) {
         // 1. Pick up messages queued by the plugin thread.
-        std::vector<std::string> outgoing;
-        std::string last;
+        std::vector<Outgoing> outgoing;
+        std::map<ClientId, std::set<std::string>> subs;
         MessageHandler handler;
+        CloseHandler closeHandler;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             outgoing.swap(pending_);
-            last = lastMessage_;
+            if (!outgoing.empty()) subs = subscriptions_;
             handler = handler_;
+            closeHandler = closeHandler_;
         }
-        for (const std::string& msg : outgoing) {
-            std::string frame = MakeFrame(0x1, msg);
-            for (Client& c : clients)
-                if (c.open && !c.closing) c.outBuf += frame;
+        for (const Outgoing& msg : outgoing) {
+            std::string frame = MakeFrame(0x1, msg.text);
+            for (Client& c : clients) {
+                if (!c.open || c.closing) continue;
+                if (msg.topic.empty() ? c.id == msg.client : subs[c.id].count(msg.topic) > 0) c.outBuf += frame;
+            }
         }
 
         // 2. Wait for socket activity (short timeout so new broadcasts go out promptly).
@@ -345,6 +390,7 @@ void WsServer::Run() {
                 int one = 1;
                 setsockopt(ns, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
                 Client c;
+                c.id = nextId++;
                 c.sock = ns;
                 clients.push_back(std::move(c));
             }
@@ -361,14 +407,19 @@ void WsServer::Run() {
                     if (!c.open) {
                         bool wasOpen = c.open;
                         if (!HandleHandshake(c)) dead = true;
-                        // Give a new client the latest snapshot straight away.
-                        if (!wasOpen && c.open && !last.empty()) c.outBuf += MakeFrame(0x1, last);
+                        // Subscribe a new client and give it the latest retained messages straight away.
+                        if (!wasOpen && c.open) {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            subscriptions_[c.id] = defaultTopics_;
+                            for (const auto& r : retained_)
+                                if (defaultTopics_.count(r.first)) c.outBuf += MakeFrame(0x1, r.second);
+                        }
                     }
                     if (!dead && c.open && !c.closing) {
                         std::vector<std::string> msgs;
                         if (!HandleFrames(c, msgs)) dead = true;
                         if (handler)
-                            for (const std::string& m : msgs) handler(m);
+                            for (const std::string& m : msgs) handler(c.id, m);
                     }
                     if (c.inBuf.size() > kMaxInBuffer) dead = true;
                 } else if (n == 0 || !WouldBlock()) {
@@ -385,7 +436,14 @@ void WsServer::Run() {
             if (c.outBuf.size() > kMaxOutBuffer) dead = true;  // client can't keep up
             if (c.closing && c.outBuf.empty()) dead = true;
 
-            if (dead) { CloseSock(c.sock); c.sock = kInvalidSocket; }
+            if (dead) {
+                CloseSock(c.sock);
+                c.sock = kInvalidSocket;
+                if (c.open) {
+                    { std::lock_guard<std::mutex> lock(mutex_); subscriptions_.erase(c.id); }
+                    if (closeHandler) closeHandler(c.id);
+                }
+            }
         }
         clients.erase(std::remove_if(clients.begin(), clients.end(),
                                      [](const Client& c) { return c.sock == kInvalidSocket; }),
@@ -400,4 +458,7 @@ void WsServer::Run() {
         }
         CloseSock(c.sock);
     }
+    std::lock_guard<std::mutex> lock(mutex_);
+    subscriptions_.clear();
+    pending_.clear();
 }

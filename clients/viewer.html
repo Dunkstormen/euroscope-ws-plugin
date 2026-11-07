@@ -37,6 +37,12 @@
   tbody tr.sel { background:var(--sel); }
   .maplibregl-popup-content { font:12px/1.4 system-ui, sans-serif; color:#1b1f24; }
   .maplibregl-popup-content b { font-size:13px; }
+  .maplibregl-popup-content .muted { color:#6a737d; }
+  details.panel { border-top:1px solid var(--line); padding:4px 8px; }
+  details.panel summary { cursor:pointer; color:var(--muted); font-weight:600; padding:4px 0; }
+  details.panel table td { white-space:normal; }
+  #events { font:12px/1.5 ui-monospace, monospace; max-height:200px; overflow:auto; }
+  #events div { border-bottom:1px solid var(--line); padding:1px 0; }
 </style>
 </head>
 <body>
@@ -67,6 +73,13 @@
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
+    <details class="panel" open><summary id="ctlTitle">Controllers</summary>
+      <table><thead><tr><th>Callsign</th><th>Freq</th><th>Facility</th><th>Rating</th><th>Name</th></tr></thead>
+      <tbody id="controllers"></tbody></table></details>
+    <details class="panel" open><summary>Airports</summary>
+      <table><thead><tr><th>ICAO</th><th>Dep</th><th>Arr</th><th>METAR</th></tr></thead>
+      <tbody id="airports"></tbody></table></details>
+    <details class="panel"><summary>Events</summary><div id="events"></div></details>
   </div>
 </main>
 <script>
@@ -164,6 +177,17 @@ function addAircraftLayers() {
 
   if (!map.getSource("trails")) map.addSource("trails", { type: "geojson", data: emptyFC() });
   if (!map.getSource("aircraft")) map.addSource("aircraft", { type: "geojson", data: emptyFC() });
+  if (!map.getSource("route")) map.addSource("route", { type: "geojson", data: emptyFC() });
+
+  if (!map.getLayer("route")) map.addLayer({
+    id: "route", type: "line", source: "route",
+    paint: { "line-color": "#ff7a00", "line-width": 1.5, "line-dasharray": [3, 2], "line-opacity": 0.8 },
+  });
+  if (!map.getLayer("route-points")) map.addLayer({
+    id: "route-points", type: "symbol", source: "route", filter: ["==", ["geometry-type"], "Point"],
+    layout: { "text-field": ["get", "name"], "text-font": ["Noto Sans Medium"], "text-size": 10, "text-offset": [0, 0.8] },
+    paint: { "text-color": "#ff7a00", "text-halo-color": dark ? "#0f1216" : "#ffffff", "text-halo-width": 1.2 },
+  });
 
   if (!map.getLayer("trails")) map.addLayer({
     id: "trails", type: "line", source: "trails",
@@ -195,12 +219,14 @@ function addAircraftLayers() {
   });
 }
 
-map.on("style.load", () => { addAircraftLayers(); render(); });
+map.on("style.load", () => { addAircraftLayers(); render(); drawRoute(); });
 map.on("error", e => console.warn("map:", e.error?.message || e));
 
 // ---- state ----
 let ws = null;
-let latest = null;                 // last message from the server
+let latest = null;                 // last aircraft message from the server
+let route = null;                  // planned route of the selected aircraft (routes topic)
+const MAX_EVENTS = 50;
 const trails = new Map();          // callsign -> [[lon, lat], ...]
 let selected = store.get("selected", "") || null;
 let fitted = false;
@@ -350,19 +376,64 @@ $("smooth").onchange = () => drawFrame(performance.now());
 let popup = null;
 function popupHtml(a) {
   const f = a.flightPlan;
-  return `<b>${esc(a.callsign)}</b> ${f ? esc(f.aircraftType) : ""}<br>
+  const line = (label, v) => v ? `<br><span class="muted">${label}</span> ${esc(v)}` : "";
+  const assigned = f ? [f.clearedAltitude && `CFL ${f.clearedAltitude}`, f.assignedHeading && `HDG ${f.assignedHeading}`,
+    f.assignedSpeed && `SPD ${f.assignedSpeed}`, f.assignedMach && `M${f.assignedMach.toFixed(2)}`,
+    f.assignedRate && `${f.assignedRate} fpm`, f.directTo && `DCT ${f.directTo}`].filter(Boolean).join(" · ") : "";
+  return `<b>${esc(a.callsign)}</b> ${f ? esc(f.aircraftType) + (f.wakeCategory ? "/" + esc(f.wakeCategory) : "") : ""}<br>
     ${fl(a)} · ${a.groundSpeed} kt · ${a.heading}° · ${a.verticalSpeed} fpm<br>
-    Squawk ${esc(a.squawk)}${f ? `<br>${esc(f.origin)} → ${esc(f.destination)}${f.clearedAltitude ? ` · CFL ${f.clearedAltitude}` : ""}
-    ${f.trackingController ? `<br>Tracked by ${esc(f.trackingController)}` : ""}` : "<br>No flight plan"}`;
+    Squawk ${esc(a.squawk)}${f && f.assignedSquawk && f.assignedSquawk !== a.squawk ? ` (assigned ${esc(f.assignedSquawk)})` : ""}${f ? `
+    <br>${esc(f.origin)}${f.departureRunway ? "/" + esc(f.departureRunway) : ""} → ${esc(f.destination)}${f.arrivalRunway ? "/" + esc(f.arrivalRunway) : ""}
+    ${line("SID", f.sid)}${line("STAR", f.star)}${line("Assigned", assigned)}${line("Scratchpad", f.scratchpad)}
+    ${line("Tracked by", f.trackingController)}${line("Handoff to", f.handoffTarget)}${line("Next", f.nextController)}
+    ${line("State", f.state)}${line("Remarks", f.remarks)}` : "<br>No flight plan"}`;
+}
+
+// ---- controllers / airports / events / route ----
+function renderControllers(d) {
+  $("ctlTitle").textContent = `Controllers · me ${d.me.callsign || "-"} (${d.me.connectionType})`;
+  $("controllers").innerHTML = d.controllers.map(c => `<tr><td>${esc(c.callsign)}</td>
+    <td class="n">${c.frequency && c.frequency < 199 ? c.frequency.toFixed(3) : ""}</td><td>${esc(c.facility)}</td>
+    <td>${esc(c.rating)}</td><td>${esc(c.name)}</td></tr>`).join("");
+}
+function renderAirports(d) {
+  $("airports").innerHTML = d.airports.map(a => `<tr><td>${esc(a.icao)}</td><td>${esc(a.departureRunways.join(" "))}</td>
+    <td>${esc(a.arrivalRunways.join(" "))}</td><td>${esc(a.metar)}</td></tr>`).join("");
+}
+function addEvent(e) {
+  const { type, event, time, flightPlan, ...rest } = e;
+  const div = document.createElement("div");
+  div.textContent = `${new Date(time).toLocaleTimeString()} ${event} ${Object.entries(rest)
+    .map(([k, v]) => `${k}=${typeof v === "object" ? (v.callsign || JSON.stringify(v)) : v}`).join(" ")}`;
+  const box = $("events");
+  box.prepend(div);
+  while (box.childElementCount > MAX_EVENTS) box.lastChild.remove();
+}
+function drawRoute() {
+  const src = map.getSource("route");
+  if (!src) return;
+  if (!route || route.callsign !== selected) { src.setData(emptyFC()); return; }
+  const ahead = route.points.filter(p => !p.passed);
+  src.setData({ type: "FeatureCollection", features: [
+    { type: "Feature", geometry: { type: "LineString", coordinates: ahead.map(p => [p.lon, p.lat]) }, properties: {} },
+    ...ahead.map(p => ({ type: "Feature", geometry: { type: "Point", coordinates: [p.lon, p.lat] }, properties: { name: p.name } })),
+  ] });
+}
+// Only ask for the selected aircraft's route; routes for everyone would be a lot of data.
+function requestRoute() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ cmd: "filter", topic: "routes", callsigns: [selected || "-"] }));
+  route = null;
+  drawRoute();
 }
 function select(cs, fly) {
-  selected = cs;
+  if (cs !== selected) { selected = cs; requestRoute(); }
   store.set("selected", cs || "");
   const a = latest && latest.aircraft.find(x => x.callsign === cs);
   if (popup) popup.remove();
   if (a) {
     popup = new maplibregl.Popup({ closeButton: true, offset: 14 }).setLngLat([a.lon, a.lat]).setHTML(popupHtml(a)).addTo(map);
-    popup.on("close", () => { if (selected === cs) { selected = null; render(); } });
+    popup.on("close", () => { if (selected === cs) { selected = null; requestRoute(); render(); } });
     if (fly) map.easeTo({ center: [a.lon, a.lat], zoom: Math.max(map.getZoom(), 8) });
   }
   render();
@@ -380,10 +451,20 @@ function connect() {
   ws = new WebSocket($("url").value);
   $("connect").textContent = "Disconnect";
   setStatus("connecting…");
-  ws.onopen = () => setStatus("connected", "ok");
+  ws.onopen = () => {
+    setStatus("connected", "ok");
+    // Filter first so the routes subscription never sends every aircraft's route.
+    requestRoute();
+    ws.send(JSON.stringify({ cmd: "subscribe", topics: ["aircraft", "controllers", "airports", "events", "routes"] }));
+  };
   ws.onclose = () => { setStatus("disconnected", "bad"); $("connect").textContent = "Connect"; ws = null; };
   ws.onmessage = ev => {
     const data = JSON.parse(ev.data);
+    if (data.type === "controllers") return renderControllers(data);
+    if (data.type === "airports") return renderAirports(data);
+    if (data.type === "event") return addEvent(data);
+    if (data.type === "routes") { route = data.routes.find(r => r.callsign === selected) || null; return drawRoute(); }
+    if (data.type === "result" && !data.ok) return console.warn("server:", data.cmd, data.error);
     if (data.type !== "aircraft") return;
     latest = data;
     setStatus(`connected · ${data.count} aircraft · ${data.source || "?"} · ${new Date(data.time).toLocaleTimeString()}`, "ok");
