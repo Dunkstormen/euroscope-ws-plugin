@@ -2,3 +2,5 @@ build/
 sdk/*
 !sdk/README.md
 clients/*.pmtiles
+__pycache__/
+*.pyc
