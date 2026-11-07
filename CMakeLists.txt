@@ -19,7 +19,7 @@ if(MSVC AND ES_BUILD_PLUGIN)
         message(FATAL_ERROR "EuroScope is 32-bit. Configure with: cmake -A Win32 ..")
     endif()
     if(NOT EXISTS "${ES_SDK_DIR}/EuroScopePlugIn.h")
-        message(FATAL_ERROR "EuroScopePlugIn.h not found in ${ES_SDK_DIR}. See README.")
+        message(FATAL_ERROR "EuroScopePlugIn.h not found in ${ES_SDK_DIR}. See docs/development.md.")
     endif()
 
     add_library(WsDataPlugin SHARED src/Plugin.cpp src/WsServer.cpp)
